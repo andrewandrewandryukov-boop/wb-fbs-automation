@@ -1,4 +1,36 @@
-// WB FBS Automation v0.2.0 — read-only diagnostics; no write API calls.
+import { DurableObject } from 'cloudflare:workers';
+
+// Stores only aggregate diagnostics. Never stores API tokens, order IDs or customer data.
+export class DiagnosticHistory extends DurableObject {
+  async record(snapshot) {
+    const existing=(await this.ctx.storage.get('history')) || [];
+    const history=[snapshot,...existing].slice(0,72);
+    await this.ctx.storage.put('history',history);
+    await this.ctx.storage.put('publicStatus',{
+      service:'wb-fbs-automation',
+      version:'0.4.0',
+      mode:'READ_ONLY',
+      lastCheck:snapshot.at,
+      healthy:!!snapshot.healthy,
+      endpoints:{
+        newOrders:snapshot.checks.newOrders?.ok?'ok':'error',
+        supplies:snapshot.checks.supplies?.ok?'ok':'error',
+        shippingPoint:snapshot.checks.shippingPoint?.ok===true?'confirmed':snapshot.checks.shippingPoint?.ok===false?'error':'not_checked'
+      }
+    });
+  }
+  async publicStatus() {
+    return (await this.ctx.storage.get('publicStatus')) || null;
+  }
+  async recentHistory() {
+    return (await this.ctx.storage.get('history')) || [];
+  }
+}
+function historyStore(env) {
+  return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
+}
+
+// WB FBS Automation v0.4.0 — scheduled read-only diagnostics, safe durable history.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -148,20 +180,102 @@ async function runDiagnostics(env) {
   }
   return out;
 }
+// Runs automatically in Cloudflare on a cron trigger. GET only, no FBS writes.
+async function runScheduledDiagnostics(env) {
+  const now=new Date();
+  const snapshot={
+    at:now.toISOString(),
+    version:'0.4.0',
+    mode:'READ_ONLY',
+    checks:{},
+    healthy:false
+  };
+  if (!env.WB_API_TOKEN) {
+    snapshot.checks.configuration={ok:false,error:'token_not_configured'};
+    return snapshot;
+  }
+  async function query(name,path,parse) {
+    try {
+      const response=await fetch(API+path,{
+        method:'GET',
+        headers:{Authorization:env.WB_API_TOKEN,Accept:'application/json'},
+        signal:AbortSignal.timeout(12000)
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        snapshot.checks[name]={ok:false,http:response.status};
+        return;
+      }
+      const body=await response.json();
+      snapshot.checks[name]={ok:true,http:response.status,...parse(body)};
+    } catch {
+      snapshot.checks[name]={ok:false,error:'network_or_timeout'};
+    }
+  }
+  await Promise.all([
+    query('newOrders','/api/v3/orders/new',data=>({
+      count:Array.isArray(data?.orders)?data.orders.length:null
+    })),
+    query('supplies','/api/v3/supplies?limit=100&next=0',data=>{
+      const rows=Array.isArray(data?.supplies)?data.supplies:[];
+      const recent=rows.filter(x=>String(x.createdAt||'')>='2026-10-01');
+      return {
+        count:rows.length,
+        hasNextPage:!!data?.next,
+        sinceOct1:recent.length,
+        sinceOct1WithShippingDate:recent.filter(x=>!!x.shippingDt).length,
+        sinceOct1WithShippingPoint:recent.filter(x=>x.shippingPointId!=null).length,
+        sinceOct1ToCaucasus:recent.filter(x=>Number(x.shippingPointId)===353731).length
+      };
+    })
+  ]);
+  // Validate the target SC once per day; avoid downloading 5,000+ offices hourly.
+  if (now.getUTCHours()===0) {
+    await query('shippingPoint','/api/marketplace/v3/fbs/shipping-points?city=%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0&cargoType=1',data=>{
+      const found=pointRows(data).find(x=>Number(x.id)===353731 && x.officeType==='sc');
+      return {confirmed:!!found};
+    });
+    if (snapshot.checks.shippingPoint?.ok===true && !snapshot.checks.shippingPoint.confirmed) {
+      snapshot.checks.shippingPoint.ok=false;
+      snapshot.checks.shippingPoint.error='target_sc_not_found';
+    }
+  }
+  snapshot.healthy=!!snapshot.checks.newOrders?.ok && !!snapshot.checks.supplies?.ok &&
+    snapshot.checks.shippingPoint?.ok!==false;
+  return snapshot;
+}
 export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.3.0',mode:'READ_ONLY'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.4.0',mode:'READ_ONLY',scheduled:'hourly'});
     }
-    if (!['/diagnostics','/diagnostics/shipping-dates'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
+    if (request.method==='GET' && path==='/status') {
+      if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
+      const latest=await historyStore(env).publicStatus();
+      return Response.json(latest || {service:'wb-fbs-automation',version:'0.4.0',mode:'READ_ONLY',status:'waiting_for_first_scheduled_check'},{
+        headers:{'Cache-Control':'no-store'}
+      });
+    }
+    if (!['/diagnostics','/diagnostics/shipping-dates','/diagnostics/history'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
     if (!env.ADMIN_KEY) return Response.json({error:'ADMIN_KEY not configured'},{status:503});
     const provided=request.headers.get('X-Admin-Key');
     if (!provided || provided!==env.ADMIN_KEY) return new Response('Unauthorized',{status:401});
+    if (path==='/diagnostics/history') {
+      if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
+      return Response.json({version:'0.4.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+    }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
-  async scheduled(_event,env) {
-    // Intentionally no FBS writes or background order processing.
-    console.log(JSON.stringify({service:'wb-fbs-automation',version:'0.3.0',mode:'READ_ONLY',configured:!!env.WB_API_TOKEN}));
+  async scheduled(_event,env,ctx) {
+    ctx.waitUntil((async()=>{
+      try {
+        const snapshot=await runScheduledDiagnostics(env);
+        await historyStore(env).record(snapshot);
+        console.log(JSON.stringify({event:'scheduled_diagnostics',at:snapshot.at,healthy:snapshot.healthy}));
+      } catch {
+        console.error(JSON.stringify({event:'scheduled_diagnostics_failed',reason:'internal_error'}));
+      }
+    })());
   }
 };
