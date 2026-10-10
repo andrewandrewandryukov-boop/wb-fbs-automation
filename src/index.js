@@ -27,7 +27,7 @@ async function diagnose(env) {
 export default {
   async fetch(request,env){
     const url=new URL(request.url);
-    if(url.pathname==='/health') return Response.json({ok:true,service:'wb-fbs-automation',mode:'READ_ONLY'});
+    if(request.method==='GET' && (url.pathname==='/' || url.pathname==='/health')) return Response.json({ok:true,service:'wb-fbs-automation',version:'0.1.1',mode:'READ_ONLY',next:'configure ADMIN_KEY and check /diagnostics'});
     if(url.pathname!=='/diagnostics'||request.method!=='GET') return new Response('Not found',{status:404});
     if(!env.ADMIN_KEY) return Response.json({error:'ADMIN_KEY not configured'},{status:503});
     const provided=request.headers.get('X-Admin-Key');
