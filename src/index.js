@@ -10,7 +10,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.5.1',
+      version:'0.6.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -57,7 +57,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.5.1',
+      ...current,service:'wb-fbs-automation',version:'0.6.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -69,13 +69,58 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.5.1',
+      ...current,service:'wb-fbs-automation',version:'0.6.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.5.1',mode:'READ_ONLY',...stats};
+    return {version:'0.6.0',mode:'READ_ONLY',...stats};
+  }
+  // Bootstrap one persistent five-minute alarm without a Cron Trigger.
+  async ensureAlarm() {
+    const existing=await this.ctx.storage.getAlarm();
+    if (existing!==null) return {scheduled:true,nextRun:new Date(existing).toISOString()};
+    if (!this.env.WB_API_TOKEN) return {scheduled:false,error:'token_not_configured'};
+    const next=Date.now()+60*1000;
+    await this.ctx.storage.setAlarm(next);
+    return {scheduled:true,nextRun:new Date(next).toISOString()};
+  }
+  async alarm() {
+    const at=new Date().toISOString();
+    try {
+      if (!this.env.WB_API_TOKEN) {
+        await this.recordPollError(at,'token_not_configured');
+      } else {
+        const response=await fetch(API+'/api/v3/orders/new',{
+          method:'GET',
+          headers:{Authorization:this.env.WB_API_TOKEN,Accept:'application/json'},
+          signal:AbortSignal.timeout(12000)
+        });
+        if (!response.ok) {
+          await response.body?.cancel();
+          await this.recordPollError(at,response.status===429?'rate_limited':'wb_api_error',response.status);
+        } else {
+          const data=await response.json();
+          if (!Array.isArray(data?.orders)) {
+            await this.recordPollError(at,'unexpected_response_shape',response.status);
+          } else {
+            await this.observeOrders(data.orders.map(x=>({id:x.id,warehouseId:x.warehouseId})),at);
+          }
+        }
+      }
+      const hour=at.slice(0,13);
+      if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
+        const snapshot=await runScheduledDiagnostics(this.env);
+        await this.record(snapshot);
+        await this.ctx.storage.put('lastHourlyBucket',hour);
+      }
+    } catch {
+      try { await this.recordPollError(at,'alarm_internal_error'); }
+      catch { console.error(JSON.stringify({event:'alarm_record_error'})); }
+    } finally {
+      await this.ctx.storage.setAlarm(Date.now()+5*60*1000);
+    }
   }
   async publicStatus() {
     return (await this.ctx.storage.get('publicStatus')) || null;
@@ -88,7 +133,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.5.1 — scheduled read-only diagnostics, safe durable history.
+// WB FBS Automation v0.6.0 — scheduled read-only diagnostics, safe durable history.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -274,7 +319,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.5.1',
+    version:'0.6.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -337,14 +382,19 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.5.1',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.6.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
-      const latest=await historyStore(env).publicStatus();
-      return Response.json(latest || {service:'wb-fbs-automation',version:'0.5.1',mode:'READ_ONLY',status:'waiting_for_first_scheduled_check'},{
-        headers:{'Cache-Control':'no-store'}
-      });
+      const store=historyStore(env);
+      const alarm=await store.ensureAlarm();
+      const latest=await store.publicStatus();
+      return Response.json({
+        ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
+        version:'0.6.0',
+        scheduler:'durable_object_alarm',
+        alarm
+      },{headers:{'Cache-Control':'no-store'}});
     }
     if (!['/diagnostics','/diagnostics/shipping-dates','/diagnostics/history','/diagnostics/order-monitor'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
     if (!env.ADMIN_KEY) return Response.json({error:'ADMIN_KEY not configured'},{status:503});
@@ -356,29 +406,11 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.5.1',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.6.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
-  async scheduled(event,env,ctx) {
-    ctx.waitUntil((async()=>{
-      if (!env.DIAG_HISTORY) {
-        console.error(JSON.stringify({event:'scheduled_checks',error:'missing_history_binding'}));
-        return;
-      }
-      if (event.cron==='*/5 * * * *') {
-        try { await pollNewFbsOrders(env); }
-        catch { console.error(JSON.stringify({event:'order_poll_failed',reason:'internal_error'})); }
-      }
-      if (event.cron==='*/5 * * * *' && new Date(event.scheduledTime).getUTCMinutes()===0) {
-        try {
-          const snapshot=await runScheduledDiagnostics(env);
-          await historyStore(env).record(snapshot);
-          console.log(JSON.stringify({event:'scheduled_diagnostics',at:snapshot.at,healthy:snapshot.healthy}));
-        } catch {
-          console.error(JSON.stringify({event:'scheduled_diagnostics_failed',reason:'internal_error'}));
-        }
-      }
-    })());
-  }
-};
+  async scheduled(_event,_env,_ctx) {
+    // Ignore legacy cron events if any were registered by a partial deployment.
+    // All active monitoring uses Durable Object alarm().
+  }};
