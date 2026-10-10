@@ -18,10 +18,10 @@ function concat(parts) {
 async function transformStream(input,kind) {
   const stream=kind==='inflate'?new DecompressionStream('deflate'):new CompressionStream('deflate');
   const writer=stream.writable.getWriter();
-  const write=writer.write(input);
-  await write;
+  const readPromise=new Response(stream.readable).arrayBuffer();
+  await writer.write(input);
   await writer.close();
-  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  return new Uint8Array(await readPromise);
 }
 async function pngToRgb(png) {
   if(png.length<33 || png.subarray(0,8).some((v,i)=>v!==[137,80,78,71,13,10,26,10][i])) throw Error('invalid_png');
