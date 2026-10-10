@@ -153,7 +153,7 @@ export class DiagnosticHistory extends DurableObject {
       const chat=message?.chat;
       if (!chat || chat.type!=='private' || !Number.isSafeInteger(chat.id)) continue;
       const text=String(message.text||'').trim();
-      const match=/^\\/start(?:@[A-Za-z0-9_]+)?\\s+([A-Za-z0-9_-]+)$/.exec(text);
+      const match=/^\/start(?:@[A-Za-z0-9_]+)?\s+([A-Za-z0-9_-]+)$/.exec(text);
       if (!match || match[1]!==code) continue;
       // A single recipient is locked on first successful pairing.
       await this.ctx.storage.put('telegramRecipient',{chatId:chat.id,pairedAt:new Date().toISOString()});
