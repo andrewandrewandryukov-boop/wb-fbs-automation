@@ -3,6 +3,32 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-10",
   "workers_dev": true,
-  "vars": { "FBS_MODE": "READ_ONLY", "TARGET_SC": "Кавказский бульвар" },
-  "observability": { "enabled": true }
+  "vars": {
+    "FBS_MODE": "READ_ONLY",
+    "TARGET_SC": "Кавказский бульвар"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "0 * * * *"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DIAG_HISTORY",
+        "class_name": "DiagnosticHistory"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1_diagnostic_history",
+      "new_sqlite_classes": [
+        "DiagnosticHistory"
+      ]
+    }
+  ]
 }
