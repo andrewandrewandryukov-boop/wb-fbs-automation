@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 
-// Stores only aggregate diagnostics. Never stores API tokens, order IDs or customer data.
+// Private durable state: aggregate diagnostics plus order IDs for idempotency. No tokens or buyer details.
 export class DiagnosticHistory extends DurableObject {
   async record(snapshot) {
     const existing=(await this.ctx.storage.get('history')) || [];
@@ -337,7 +337,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.5.0',mode:'READ_ONLY',scheduled:'hourly'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.5.0',mode:'READ_ONLY',orderPolling:'every_minute',diagnostics:'hourly'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
