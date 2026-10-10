@@ -159,7 +159,7 @@ export class DiagnosticHistory extends DurableObject {
       await this.ctx.storage.put('telegramRecipient',{chatId:chat.id,pairedAt:new Date().toISOString()});
       const confirmation=await fetch(base+'sendMessage',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({chat_id:chat.id,text:'✅ MarketPilot подключён к WB FBS Automation. Мониторинг заказов работает. Автоматическая отправка документов будет включена после проверки сценария WB.'}),
+        body:JSON.stringify({chat_id:chat.id,text:'✅ Telegram-бот подключён к WB FBS Automation. Мониторинг заказов работает. Автоматическая отправка документов будет включена после проверки сценария WB.'}),
         signal:AbortSignal.timeout(12000)
       });
       await confirmation.body?.cancel();
