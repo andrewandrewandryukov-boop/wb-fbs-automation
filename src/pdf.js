@@ -39,6 +39,9 @@ async function pngToRgb(png) {
   }
   const channels=({0:1,2:3,3:1,4:2,6:4})[type];
   if(!channels || depth!==8 || interlace!==0 || !width || !height || width>4096 || height>4096) throw Error('unsupported_png');
+  // Lossless zero-copy path: PDF PNG Predictor 15 understands the original RGB
+  // scanline filters. Avoid expensive 800x600 pixel processing on Cloudflare Free.
+  if(type===2) return {width,height,compressed:concat(idat),predictor:true};
   const raw=await transformStream(concat(idat),'inflate');
   const stride=width*channels,expected=height*(stride+1);
   if(raw.length!==expected)throw Error('png_length_mismatch');
@@ -101,7 +104,7 @@ export async function officialPngPdf(base64,{widthMm=58,heightMm=40}={}){
     ascii('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
     ascii('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 '+w.toFixed(4)+' '+h.toFixed(4)+'] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>'),
     streamObject('<<',content),
-    streamObject('<< /Type /XObject /Subtype /Image /Width '+img.width+' /Height '+img.height+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode',img.compressed)
+    streamObject('<< /Type /XObject /Subtype /Image /Width '+img.width+' /Height '+img.height+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode'+(img.predictor?' /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns '+img.width+' >>':''),img.compressed)
   ];
   return pdfObjects(objects);
 }
