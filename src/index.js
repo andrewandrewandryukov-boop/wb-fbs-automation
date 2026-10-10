@@ -10,7 +10,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.8.0',
+      version:'0.9.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -57,7 +57,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.8.0',
+      ...current,service:'wb-fbs-automation',version:'0.9.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -69,13 +69,13 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.8.0',
+      ...current,service:'wb-fbs-automation',version:'0.9.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.8.0',mode:'READ_ONLY',...stats};
+    return {version:'0.9.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -114,6 +114,8 @@ export class DiagnosticHistory extends DurableObject {
       catch { console.error(JSON.stringify({event:'telegram_pairing_poll_failed'})); }
       try { await this.sendTelegramConnectionTestOnce(); }
       catch { console.error(JSON.stringify({event:'telegram_connection_test_failed'})); }
+      try { await this.probeDocumentSourcesOnce(); }
+      catch { console.error(JSON.stringify({event:'document_source_probe_failed'})); }
       const hour=at.slice(0,13);
       if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
         const snapshot=await runScheduledDiagnostics(this.env);
@@ -199,6 +201,56 @@ export class DiagnosticHistory extends DurableObject {
     const result=await this.ctx.storage.get('telegramConnectionTest');
     return result?.state || 'not_sent';
   }
+  // One-time document-source check on an EXISTING closed supply for target SC.
+  // No WB mutations: GET barcode, GET order IDs, POST sticker retrieval (read operation).
+  // Never return or persist raw QR, sticker, supply ID or order ID.
+  async probeDocumentSourcesOnce() {
+    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('documentProbe')) return;
+    const at=new Date().toISOString();
+    const result={state:'attempted',at,qr:'not_checked',sticker:'not_checked'};
+    await this.ctx.storage.put('documentProbe',result);
+    const headers={Authorization:this.env.WB_API_TOKEN,Accept:'application/json'};
+    const request=async(path,init={})=>{
+      const r=await fetch(API+path,{...init,headers:{...headers,...(init.headers||{})},signal:AbortSignal.timeout(12000)});
+      if (!r.ok) {await r.body?.cancel();return {http:r.status,body:null};}
+      return {http:r.status,body:await r.json()};
+    };
+    try {
+      const list=await request('/api/v3/supplies?limit=100&next=0');
+      if (!list.body) {result.state='failed';result.stage='supplies';result.http=list.http;}
+      else {
+        const rows=Array.isArray(list.body.supplies)?list.body.supplies:[];
+        const supply=rows.find(x=>x.done===true && Number(x.shippingPointId)===353731 && /^WB-GI-[0-9]+$/.test(String(x.id||'')));
+        if (!supply) {result.state='no_eligible_historical_supply';}
+        else {
+          const id=encodeURIComponent(supply.id);
+          const qr=await request('/api/v3/supplies/'+id+'/barcode?type=png');
+          result.qr=qr.http===200 && typeof qr.body?.file==='string' && qr.body.file.startsWith('iVBOR')?'available':'unavailable';
+          result.qrHttp=qr.http;
+          const orderIds=await request('/api/marketplace/v3/supplies/'+id+'/order-ids');
+          result.orderIds=orderIds.http===200 && Array.isArray(orderIds.body?.orderIds)?'available':'unavailable';
+          result.orderIdsHttp=orderIds.http;
+          const orderId=orderIds.body?.orderIds?.find(x=>Number.isSafeInteger(x) && x>0);
+          if (orderId) {
+            const stickers=await request('/api/v3/orders/stickers?type=png&width=40&height=30',{
+              method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orders:[orderId]})
+            });
+            const sticker=stickers.body?.stickers?.find(x=>x.orderId===orderId);
+            result.sticker=stickers.http===200 && typeof sticker?.file==='string' && sticker.file.startsWith('iVBOR')?'available':'unavailable';
+            result.stickerHttp=stickers.http;
+          } else {result.sticker='no_order_id';}
+          result.state=result.qr==='available' && result.sticker==='available'?'complete':'partial';
+        }
+      }
+    } catch {
+      result.state='failed';
+      result.stage='network_or_timeout';
+    }
+    await this.ctx.storage.put('documentProbe',result);
+  }
+  async documentProbeSummary() {
+    return (await this.ctx.storage.get('documentProbe')) || {state:'not_started'};
+  }
   async publicStatus() {
     return (await this.ctx.storage.get('publicStatus')) || null;
   }
@@ -210,7 +262,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.8.0 — read-only order monitoring, Telegram pairing and one-time delivery test.
+// WB FBS Automation v0.9.0 — read-only monitoring, Telegram delivery test and historical document source probe.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -396,7 +448,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.8.0',
+    version:'0.9.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -459,7 +511,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.8.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.9.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -468,10 +520,11 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.8.0',
+        version:'0.9.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
+        documentProbe:await store.documentProbeSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
@@ -485,7 +538,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.8.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.9.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
