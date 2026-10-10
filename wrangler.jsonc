@@ -1,0 +1,8 @@
+{
+  "name": "wb-fbs-automation",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-10",
+  "workers_dev": true,
+  "vars": { "FBS_MODE": "READ_ONLY", "TARGET_SC": "Кавказский бульвар" },
+  "observability": { "enabled": true }
+}
