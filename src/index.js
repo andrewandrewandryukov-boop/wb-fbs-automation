@@ -73,8 +73,53 @@ function summarize(name, data) {
   }
   return {shape:typeof data};
 }
+// Focused audit of the dates already stored by WB for historical supplies.
+// This is NOT evidence of how the seller cabinet populated those dates.
+async function auditShippingDates(env) {
+  const result={at:new Date().toISOString(),version:'0.3.0',mode:'READ_ONLY',note:'Historical fields only; no supply changes'};
+  if (!env.WB_API_TOKEN) return {...result,error:'WB_API_TOKEN secret not configured'};
+  try {
+    const response=await fetch(API+'/api/v3/supplies?limit=100&next=0',{
+      method:'GET',headers:{Authorization:env.WB_API_TOKEN,Accept:'application/json'},
+      signal:AbortSignal.timeout(12000)
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return {...result,http:response.status,error:response.status===429?'rate_limited':'request_failed'};
+    }
+    const data=await response.json();
+    const supplies=Array.isArray(data?.supplies)?data.supplies:[];
+    const periodStats=rows=>({
+      count:rows.length,
+      withShippingDate:rows.filter(x=>!!x.shippingDt).length,
+      withoutShippingDate:rows.filter(x=>!x.shippingDt).length,
+      withShippingPoint:rows.filter(x=>x.shippingPointId!=null).length,
+      toCaucasus:rows.filter(x=>Number(x.shippingPointId)===353731).length,
+      selfShipping:rows.filter(x=>x.shippingType==='selfShipping').length,
+      scanned:rows.filter(x=>!!x.scanDt).length
+    });
+    const recent=[...supplies].sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||''))).slice(0,12);
+    return {
+      ...result,http:response.status,
+      note:'Dates stored in WB; manual UI request capture still needed to learn how dates are set',
+      returnedCount:supplies.length,hasNextPage:!!data?.next,
+      sinceOct1:periodStats(supplies.filter(x=>String(x.createdAt||'')>='2026-10-01')),
+      beforeOct1:periodStats(supplies.filter(x=>String(x.createdAt||'')<'2026-10-01')),
+      recent:recent.map(x=>({
+        createdDay:String(x.createdAt||'').slice(0,10),
+        shippingDay:x.shippingDt||null,
+        shippingPointId:x.shippingPointId??null,
+        shippingType:x.shippingType??null,
+        scanned:!!x.scanDt,
+        done:x.done??null
+      }))
+    };
+  } catch {
+    return {...result,error:'network_or_timeout'};
+  }
+}
 async function runDiagnostics(env) {
-  const out = {at:new Date().toISOString(),version:'0.2.0',mode:'READ_ONLY',target:TARGET,checks:{}};
+  const out = {at:new Date().toISOString(),version:'0.3.0',mode:'READ_ONLY',target:TARGET,checks:{}};
   if (!env.WB_API_TOKEN) return {...out,error:'WB_API_TOKEN secret not configured'};
   for (const [name,path] of CHECKS) {
     try {
@@ -107,16 +152,16 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.2.0',mode:'READ_ONLY'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.3.0',mode:'READ_ONLY'});
     }
-    if (path!=='/diagnostics' || request.method!=='GET') return new Response('Not found',{status:404});
+    if (!['/diagnostics','/diagnostics/shipping-dates'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
     if (!env.ADMIN_KEY) return Response.json({error:'ADMIN_KEY not configured'},{status:503});
     const provided=request.headers.get('X-Admin-Key');
     if (!provided || provided!==env.ADMIN_KEY) return new Response('Unauthorized',{status:401});
-    return Response.json(await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
+    return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
   async scheduled(_event,env) {
     // Intentionally no FBS writes or background order processing.
-    console.log(JSON.stringify({service:'wb-fbs-automation',version:'0.2.0',mode:'READ_ONLY',configured:!!env.WB_API_TOKEN}));
+    console.log(JSON.stringify({service:'wb-fbs-automation',version:'0.3.0',mode:'READ_ONLY',configured:!!env.WB_API_TOKEN}));
   }
 };
