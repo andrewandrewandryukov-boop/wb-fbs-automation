@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.16.0',
+      version:'0.17.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -59,7 +59,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.16.0',
+      ...current,service:'wb-fbs-automation',version:'0.17.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -71,7 +71,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.16.0',
+      ...current,service:'wb-fbs-automation',version:'0.17.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
@@ -91,7 +91,7 @@ export class DiagnosticHistory extends DurableObject {
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.16.0',mode:'READ_ONLY',...stats};
+    return {version:'0.17.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -441,10 +441,10 @@ export class DiagnosticHistory extends DurableObject {
   // No order IDs, SKUs, labels, names, images, buyer details or PDF bytes
   // are saved or returned. No WB writes and no Telegram sends.
   async probePendingOrderOnce() {
-    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('pendingOrderProbeV1')) return;
+    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('pendingOrderProbeV2')) return;
     const result={state:'started',at:new Date().toISOString(),mode:'READ_ONLY'};
     // Mark BEFORE network I/O; ambiguous network failure cannot cause a retry storm.
-    await this.ctx.storage.put('pendingOrderProbeV1',result);
+    await this.ctx.storage.put('pendingOrderProbeV2',result);
     const headers={Authorization:this.env.WB_API_TOKEN,Accept:'application/json'};
     try {
       const pendingResponse=await fetch(API+'/api/v3/orders/new',{
@@ -508,11 +508,28 @@ export class DiagnosticHistory extends DurableObject {
                   result.state='sticker_api_error';
                 } else {
                   const stickers=await stickerResponse.json();
-                  const matching=Array.isArray(stickers?.stickers)
-                    ? stickers.stickers.filter(x=>x.orderId===orderId && typeof x.file==='string'&&x.file.startsWith('iVBOR')):[];
-                  result.officialStickerMatched=matching.length===1;
-                  if (!result.officialStickerMatched) result.state='official_sticker_not_verified';
-                  else {
+                  const rows=Array.isArray(stickers?.stickers)?stickers.stickers:[];
+                  // Only safe shape and type diagnostics: no IDs or sticker bytes.
+                  result.stickerRows=rows.length;
+                  result.stickerFieldNames=rows.length?Object.keys(rows[0])
+                    .filter(k=>['orderId','file','partA','partB','barcode','type'].includes(k)):[];
+                  const sameId=rows.filter(x=>{
+                    const id=x?.orderId;
+                    return (typeof id==='number'||typeof id==='string') &&
+                      /^\\d+$/.test(String(id)) && String(BigInt(id))===String(BigInt(orderId));
+                  });
+                  result.matchingOrderIdCount=sameId.length;
+                  result.stickerIdValueType=rows.length?typeof rows[0]?.orderId:'absent';
+                  result.stickerFileValueType=sameId.length?typeof sameId[0]?.file:'absent';
+                  result.stickerFileHasPngPrefix=!!(sameId.length &&
+                    typeof sameId[0]?.file==='string' && sameId[0].file.startsWith('iVBOR'));
+                  const matching=sameId.filter(x=>typeof x.file==='string'&&x.file.startsWith('iVBOR'));
+                  result.officialStickerMatched=matching.length===1 && sameId.length===1;
+                  if (!result.officialStickerMatched) {
+                    result.state=rows.length===0?'sticker_response_empty':
+                      sameId.length===0?'sticker_order_id_mismatch':
+                      sameId.length>1?'sticker_duplicate_order_id':'sticker_image_missing';
+                  } else {
                     // Only a local, in-memory PDF test. No downloads, storage or sends.
                     const pdf=await officialPngPdf(matching[0].file,{widthMm:40,heightMm:30});
                     result.stickerPdfValid=pdf.length>300 &&
@@ -529,10 +546,10 @@ export class DiagnosticHistory extends DurableObject {
     } catch {
       result.state='network_or_renderer_error';
     }
-    await this.ctx.storage.put('pendingOrderProbeV1',result);
+    await this.ctx.storage.put('pendingOrderProbeV2',result);
   }
   async pendingOrderProbeSummary() {
-    return (await this.ctx.storage.get('pendingOrderProbeV1')) || {state:'not_started'};
+    return (await this.ctx.storage.get('pendingOrderProbeV2')) || {state:'not_started'};
   }
   async contentCardProbeSummary() {
     if (!this.env.WB_API_TOKEN) return {state:'awaiting_wb_token'};
@@ -549,7 +566,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.16.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
+// WB FBS Automation v0.17.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -735,7 +752,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.16.0',
+    version:'0.17.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -798,7 +815,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.16.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.17.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -807,7 +824,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.16.0',
+        version:'0.17.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -830,7 +847,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.16.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.17.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
