@@ -108,3 +108,35 @@ export async function officialPngPdf(base64,{widthMm=58,heightMm=40}={}){
   ];
   return pdfObjects(objects);
 }
+
+
+// Four-page raster PDF compositor for already-rendered label pages.
+// Inputs MUST be supplied in order: cover, product details, product barcode,
+// official WB sticker. This function never invents product data or a WB sticker.
+// It does not validate business identity: caller must verify IDs/SKU separately.
+export async function fourPagePngPdf(pages) {
+  if (!Array.isArray(pages) || pages.length!==4) throw Error('exactly_four_pages_required');
+  const maxBase64=2*1024*1024;
+  const images=[];
+  for (const base64 of pages) {
+    if (typeof base64!=='string' || !base64.startsWith('iVBOR') || base64.length>maxBase64)
+      throw Error('invalid_or_oversized_png');
+    images.push(await pngToRgb(bytesFromBase64(base64)));
+  }
+  const w=40*72/25.4,h=30*72/25.4;
+  const objects=[
+    ascii('<< /Type /Catalog /Pages 2 0 R >>'),
+    ascii('<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R 12 0 R] /Count 4 >>')
+  ];
+  for (let i=0;i<4;i++) {
+    const img=images[i],base=3+i*3;
+    const scale=Math.min(w/img.width,h/img.height);
+    const iw=img.width*scale,ih=img.height*scale;
+    const x=(w-iw)/2,y=(h-ih)/2;
+    const content=ascii('q\\n'+[iw,0,0,ih,x,y].map(n=>n.toFixed(4)).join(' ')+' cm\\n/Im1 Do\\nQ\\n');
+    objects.push(ascii('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 '+w.toFixed(4)+' '+h.toFixed(4)+'] /Resources << /XObject << /Im1 '+(base+2)+' 0 R >> >> /Contents '+(base+1)+' 0 R >>'));
+    objects.push(streamObject('<<',content));
+    objects.push(streamObject('<< /Type /XObject /Subtype /Image /Width '+img.width+' /Height '+img.height+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode'+(img.predictor?' /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns '+img.width+' >>':''),img.compressed));
+  }
+  return pdfObjects(objects);
+}
