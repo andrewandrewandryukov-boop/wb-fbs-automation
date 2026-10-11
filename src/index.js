@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.17.0',
+      version:'0.18.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -59,7 +59,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.17.0',
+      ...current,service:'wb-fbs-automation',version:'0.18.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -71,7 +71,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.17.0',
+      ...current,service:'wb-fbs-automation',version:'0.18.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
@@ -91,7 +91,7 @@ export class DiagnosticHistory extends DurableObject {
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.17.0',mode:'READ_ONLY',...stats};
+    return {version:'0.18.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -140,6 +140,8 @@ export class DiagnosticHistory extends DurableObject {
       catch { console.error(JSON.stringify({event:'content_card_probe_failed'})); }
       try { await this.probePendingOrderOnce(); }
       catch { console.error(JSON.stringify({event:'pending_order_probe_failed'})); }
+      try { await this.probeHistoricalStickerPdfOnce(); }
+      catch { console.error(JSON.stringify({event:'historical_sticker_pdf_probe_failed'})); }
       const hour=at.slice(0,13);
       if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
         const snapshot=await runScheduledDiagnostics(this.env);
@@ -548,8 +550,89 @@ export class DiagnosticHistory extends DurableObject {
     }
     await this.ctx.storage.put('pendingOrderProbeV2',result);
   }
+  // V0.18 historical closed-supply preview: read-only and single-attempt.
+  // Uses only one previously completed supply at the verified SC.
+  // No new supply, order transition, dates, Telegram sends or stored PDF bytes.
+  async probeHistoricalStickerPdfOnce() {
+    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('historicalStickerPdfProbeV1')) return;
+    const result={state:'started',at:new Date().toISOString(),mode:'READ_ONLY'};
+    await this.ctx.storage.put('historicalStickerPdfProbeV1',result);
+    const headers={Authorization:this.env.WB_API_TOKEN,Accept:'application/json'};
+    const get=async(path)=>{
+      const response=await fetch(API+path,{headers,signal:AbortSignal.timeout(12000)});
+      if (!response.ok) {await response.body?.cancel();return {http:response.status,body:null};}
+      return {http:response.status,body:await response.json()};
+    };
+    try {
+      const list=await get('/api/v3/supplies?limit=100&next=0');
+      result.suppliesHttp=list.http;
+      if (!list.body) result.state='supplies_api_error';
+      else {
+        const eligible=(Array.isArray(list.body.supplies)?list.body.supplies:[])
+          .filter(x=>x.done===true && Number(x.shippingPointId)===353731 &&
+            /^WB-GI-[0-9]+$/.test(String(x.id||'')));
+        result.eligibleHistoricalSupplies=eligible.length;
+        if (!eligible.length) result.state='no_verified_historical_supply';
+        else {
+          const supply=eligible[0];
+          const orderIds=await get('/api/marketplace/v3/supplies/'+encodeURIComponent(supply.id)+'/order-ids');
+          result.orderIdsHttp=orderIds.http;
+          if (!orderIds.body) result.state='historical_order_ids_api_error';
+          else {
+            const ids=Array.isArray(orderIds.body.orderIds)?orderIds.body.orderIds:[];
+            result.ordersInHistoricalSupply=ids.length;
+            if (ids.length!==1 || !Number.isSafeInteger(ids[0]) || ids[0]<=0) {
+              result.state='historical_supply_not_single_order';
+            } else {
+              const orderId=ids[0];
+              // This is a sticker retrieval endpoint (read semantics, POST syntax).
+              const response=await fetch(API+'/api/v3/orders/stickers?type=png&width=40&height=30',{
+                method:'POST',headers:{...headers,'Content-Type':'application/json'},
+                body:JSON.stringify({orders:[orderId]}),signal:AbortSignal.timeout(12000)
+              });
+              result.stickerHttp=response.status;
+              if (!response.ok) {
+                await response.body?.cancel();
+                result.state='historical_sticker_api_error';
+              } else {
+                const data=await response.json();
+                const stickers=Array.isArray(data?.stickers)?data.stickers:[];
+                const matches=stickers.filter(x=>
+                  (typeof x.orderId==='number'||typeof x.orderId==='string') &&
+                  String(x.orderId)===String(orderId) &&
+                  typeof x.file==='string' && x.file.startsWith('iVBOR'));
+                result.officialStickerMatched=matches.length===1;
+                if (matches.length!==1) result.state='historical_sticker_not_verified';
+                else {
+                  const pdf=await officialPngPdf(matches[0].file,{widthMm:40,heightMm:30});
+                  result.pdfValid=pdf.length>300 &&
+                    new TextDecoder().decode(pdf.subarray(0,5))==='%PDF-';
+                  result.pageSize='40x30mm';
+                  result.pageCount=1;
+                  result.pdfBytes=pdf.length;
+                  result.state=result.pdfValid?'historical_sticker_pdf_verified':'historical_pdf_invalid';
+                  // The generated PDF is intentionally discarded.
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch { result.state='network_or_pdf_error'; }
+    await this.ctx.storage.put('historicalStickerPdfProbeV1',result);
+  }
+  async historicalStickerPdfProbeSummary() {
+    return (await this.ctx.storage.get('historicalStickerPdfProbeV1'))||{state:'not_started'};
+  }
   async pendingOrderProbeSummary() {
-    return (await this.ctx.storage.get('pendingOrderProbeV2')) || {state:'not_started'};
+    const result=(await this.ctx.storage.get('pendingOrderProbeV2')) || {state:'not_started'};
+    if (result.state==='sticker_response_empty') return {
+      ...result,state:'awaiting_sticker_eligibility',
+      evidence:'HTTP_200_with_zero_stickers',
+      reasonConfirmed:false,
+      note:'WB returned no sticker; order status eligibility is a possible cause, not yet proven.'
+    };
+    return result;
   }
   async contentCardProbeSummary() {
     if (!this.env.WB_API_TOKEN) return {state:'awaiting_wb_token'};
@@ -566,7 +649,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.17.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
+// WB FBS Automation v0.18.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -752,7 +835,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.17.0',
+    version:'0.18.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -815,7 +898,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.17.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.18.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -824,7 +907,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.17.0',
+        version:'0.18.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -834,6 +917,7 @@ export default {
         contentCardProbe:await store.contentCardProbeSummary(),
         orders:await store.publicOrderSummary(),
         pendingOrderProbe:await store.pendingOrderProbeSummary(),
+        historicalStickerPdfProbe:await store.historicalStickerPdfProbeSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
@@ -847,7 +931,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.17.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.18.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
