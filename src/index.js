@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.12.0',
+      version:'0.13.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -58,7 +58,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.12.0',
+      ...current,service:'wb-fbs-automation',version:'0.13.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -70,13 +70,13 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.12.0',
+      ...current,service:'wb-fbs-automation',version:'0.13.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.12.0',mode:'READ_ONLY',...stats};
+    return {version:'0.13.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -349,7 +349,7 @@ export class DiagnosticHistory extends DurableObject {
   // A separate Content-category token is required; the Marketplace token is unchanged.
   // Store only field presence and match status, never the card or product values.
   async probeContentCardOnce() {
-    if (!this.env.WB_CONTENT_TOKEN || await this.ctx.storage.get('contentCardProbe')) return;
+    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('contentCardProbe')) return;
     const result={state:'attempted',at:new Date().toISOString()};
     await this.ctx.storage.put('contentCardProbe',result);
     try {
@@ -367,7 +367,7 @@ export class DiagnosticHistory extends DurableObject {
         else {
           const cardResponse=await fetch('https://content-api.wildberries.ru/content/v2/get/cards/list',{
             method:'POST',
-            headers:{Authorization:this.env.WB_CONTENT_TOKEN,'Content-Type':'application/json',Accept:'application/json'},
+            headers:{Authorization:this.env.WB_API_TOKEN,'Content-Type':'application/json',Accept:'application/json'},
             body:JSON.stringify({settings:{cursor:{limit:10},filter:{textSearch:String(sample.nmId),withPhoto:-1}}}),
             signal:AbortSignal.timeout(12000)
           });
@@ -395,7 +395,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('contentCardProbe',result);
   }
   async contentCardProbeSummary() {
-    if (!this.env.WB_CONTENT_TOKEN) return {state:'awaiting_content_token'};
+    if (!this.env.WB_API_TOKEN) return {state:'awaiting_wb_token'};
     return (await this.ctx.storage.get('contentCardProbe')) || {state:'not_started'};
   }
   async publicStatus() {
@@ -409,7 +409,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.12.0 — optional read-only WB Content API enrichment probe.
+// WB FBS Automation v0.13.0 — single WB API token for Marketplace and Content read-only probes.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -595,7 +595,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.12.0',
+    version:'0.13.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -658,7 +658,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.12.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.13.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -667,7 +667,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.12.0',
+        version:'0.13.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -688,7 +688,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.12.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.13.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
