@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.15.0',
+      version:'0.16.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -59,7 +59,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.15.0',
+      ...current,service:'wb-fbs-automation',version:'0.16.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -71,7 +71,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.15.0',
+      ...current,service:'wb-fbs-automation',version:'0.16.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
@@ -91,7 +91,7 @@ export class DiagnosticHistory extends DurableObject {
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.15.0',mode:'READ_ONLY',...stats};
+    return {version:'0.16.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -138,6 +138,8 @@ export class DiagnosticHistory extends DurableObject {
       catch { console.error(JSON.stringify({event:'pdf_engine_probe_failed'})); }
       try { await this.probeContentCardOnce(); }
       catch { console.error(JSON.stringify({event:'content_card_probe_failed'})); }
+      try { await this.probePendingOrderOnce(); }
+      catch { console.error(JSON.stringify({event:'pending_order_probe_failed'})); }
       const hour=at.slice(0,13);
       if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
         const snapshot=await runScheduledDiagnostics(this.env);
@@ -435,6 +437,103 @@ export class DiagnosticHistory extends DurableObject {
     if (attempts>=3) delete result.nextRetryAt;
     await this.ctx.storage.put(key,result);
   }
+  // V0.16: one-shot read-only preflight of ONE actually pending FBS order.
+  // No order IDs, SKUs, labels, names, images, buyer details or PDF bytes
+  // are saved or returned. No WB writes and no Telegram sends.
+  async probePendingOrderOnce() {
+    if (!this.env.WB_API_TOKEN || await this.ctx.storage.get('pendingOrderProbeV1')) return;
+    const result={state:'started',at:new Date().toISOString(),mode:'READ_ONLY'};
+    // Mark BEFORE network I/O; ambiguous network failure cannot cause a retry storm.
+    await this.ctx.storage.put('pendingOrderProbeV1',result);
+    const headers={Authorization:this.env.WB_API_TOKEN,Accept:'application/json'};
+    try {
+      const pendingResponse=await fetch(API+'/api/v3/orders/new',{
+        headers,signal:AbortSignal.timeout(12000)
+      });
+      result.pendingHttp=pendingResponse.status;
+      if (!pendingResponse.ok) {
+        await pendingResponse.body?.cancel();
+        result.state='pending_orders_api_error';
+      } else {
+        const body=await pendingResponse.json();
+        const orders=Array.isArray(body?.orders)?body.orders:[];
+        result.pendingCount=orders.length;
+        // Fail closed: do not choose an arbitrary order when multiple exist.
+        if (orders.length!==1) result.state=orders.length===0?'no_pending_order':'multiple_pending_orders';
+        else {
+          const order=orders[0];
+          const orderId=order?.id;
+          const ledger=Number.isSafeInteger(orderId) && orderId>0
+            ? await this.ctx.storage.get('order:'+String(orderId)):null;
+          result.ledgerMatch=!!ledger && ledger.state==='observed';
+          result.warehouseMatch=Number(order?.warehouseId)===1992848;
+          result.productIdPresent=Number.isSafeInteger(order?.nmId) && order.nmId>0;
+          result.orderSkuPresent=Array.isArray(order?.skus) && order.skus.some(x=>typeof x==='string'&&x.length>0);
+          if (!result.ledgerMatch || !result.warehouseMatch || !result.productIdPresent || !result.orderSkuPresent) {
+            result.state='identity_or_warehouse_not_verified';
+          } else {
+            const cardResponse=await fetch('https://content-api.wildberries.ru/content/v2/get/cards/list',{
+              method:'POST',
+              headers:{Authorization:this.env.WB_API_TOKEN,'Content-Type':'application/json',Accept:'application/json'},
+              body:JSON.stringify({settings:{cursor:{limit:20},filter:{textSearch:String(order.nmId),withPhoto:-1}}}),
+              signal:AbortSignal.timeout(12000)
+            });
+            result.contentHttp=cardResponse.status;
+            if (!cardResponse.ok) {
+              await cardResponse.body?.cancel();
+              result.state='content_api_error';
+            } else {
+              const data=await cardResponse.json();
+              const card=(Array.isArray(data?.cards)?data.cards:[]).find(x=>Number(x.nmID)===order.nmId);
+              result.cardMatched=!!card;
+              const matchedSizes=card?.sizes?.filter(sz=>Array.isArray(sz.skus)&&sz.skus.some(sku=>order.skus.includes(sku)))||[];
+              result.skuMatched=matchedSizes.length===1;
+              result.titlePresent=typeof card?.title==='string' && card.title.trim().length>0;
+              result.vendorCodePresent=typeof card?.vendorCode==='string' && card.vendorCode.trim().length>0;
+              result.sizeFieldPresent=matchedSizes.length===1 && typeof matchedSizes[0].techSize==='string';
+              result.characteristicsPresent=Array.isArray(card?.characteristics);
+              if (!result.cardMatched || !result.skuMatched || !result.titlePresent || !result.vendorCodePresent) {
+                result.state='product_identity_not_verified';
+              } else {
+                // Official WB order sticker is a READ operation despite POST method.
+                const stickerResponse=await fetch(API+'/api/v3/orders/stickers?type=png&width=40&height=30',{
+                  method:'POST',
+                  headers:{...headers,'Content-Type':'application/json'},
+                  body:JSON.stringify({orders:[orderId]}),
+                  signal:AbortSignal.timeout(12000)
+                });
+                result.stickerHttp=stickerResponse.status;
+                if (!stickerResponse.ok) {
+                  await stickerResponse.body?.cancel();
+                  result.state='sticker_api_error';
+                } else {
+                  const stickers=await stickerResponse.json();
+                  const matching=Array.isArray(stickers?.stickers)
+                    ? stickers.stickers.filter(x=>x.orderId===orderId && typeof x.file==='string'&&x.file.startsWith('iVBOR')):[];
+                  result.officialStickerMatched=matching.length===1;
+                  if (!result.officialStickerMatched) result.state='official_sticker_not_verified';
+                  else {
+                    // Only a local, in-memory PDF test. No downloads, storage or sends.
+                    const pdf=await officialPngPdf(matching[0].file,{widthMm:40,heightMm:30});
+                    result.stickerPdfValid=pdf.length>300 &&
+                      new TextDecoder().decode(pdf.subarray(0,5))==='%PDF-';
+                    result.stickerPdfPage='40x30mm';
+                    result.state=result.stickerPdfValid?'ready_for_label_layout':'pdf_engine_failed';
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      result.state='network_or_renderer_error';
+    }
+    await this.ctx.storage.put('pendingOrderProbeV1',result);
+  }
+  async pendingOrderProbeSummary() {
+    return (await this.ctx.storage.get('pendingOrderProbeV1')) || {state:'not_started'};
+  }
   async contentCardProbeSummary() {
     if (!this.env.WB_API_TOKEN) return {state:'awaiting_wb_token'};
     return (await this.ctx.storage.get('contentCardProbeV2')) || {state:'not_started'};
@@ -450,7 +549,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.15.0 — public aggregate order detection counters without order IDs.
+// WB FBS Automation v0.16.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -636,7 +735,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.15.0',
+    version:'0.16.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -699,7 +798,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.15.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.16.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -708,7 +807,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.15.0',
+        version:'0.16.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -717,6 +816,7 @@ export default {
         pdfEngineProbe:await store.pdfEngineProbeSummary(),
         contentCardProbe:await store.contentCardProbeSummary(),
         orders:await store.publicOrderSummary(),
+        pendingOrderProbe:await store.pendingOrderProbeSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
@@ -730,7 +830,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.15.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.16.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
