@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.14.0',
+      version:'0.15.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -53,12 +53,13 @@ export class DiagnosticHistory extends DurableObject {
         lastPollOk:true,
         lastPollReturned:valid.length,
         lastNewlySeen:newlySeen,
+        lastNewOrderAt:newlySeen>0?at:(stats.lastNewOrderAt||null),
         lastError:null
       });
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.14.0',
+      ...current,service:'wb-fbs-automation',version:'0.15.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -70,13 +71,27 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.14.0',
+      ...current,service:'wb-fbs-automation',version:'0.15.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
+  async publicOrderSummary() {
+    const stats=(await this.ctx.storage.get('orderMonitor'))||{};
+    const totalSeen=Number.isSafeInteger(stats.totalSeen)?stats.totalSeen:0;
+    return {
+      lastPoll:stats.lastPoll||null,
+      lastPollOk:stats.lastPollOk===true,
+      returnedByWbLastPoll:Number.isSafeInteger(stats.lastPollReturned)?stats.lastPollReturned:null,
+      newlyDetectedLastPoll:Number.isSafeInteger(stats.lastNewlySeen)?stats.lastNewlySeen:null,
+      totalDetectedSinceMonitoringStarted:totalSeen,
+      lastNewOrderAt:stats.lastNewOrderAt||null,
+      observedWithoutAutomation:totalSeen,
+      note:'Counts reflect orders first observed by this monitor; not a live WB order fulfillment status.'
+    };
+  }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.14.0',mode:'READ_ONLY',...stats};
+    return {version:'0.15.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -435,7 +450,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.14.0 — single WB token and bounded Content API recheck after token update.
+// WB FBS Automation v0.15.0 — public aggregate order detection counters without order IDs.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -621,7 +636,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.14.0',
+    version:'0.15.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -684,7 +699,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.14.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.15.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -693,7 +708,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.14.0',
+        version:'0.15.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -701,6 +716,7 @@ export default {
         orderMetadataProbe:await store.orderMetadataProbeSummary(),
         pdfEngineProbe:await store.pdfEngineProbeSummary(),
         contentCardProbe:await store.contentCardProbeSummary(),
+        orders:await store.publicOrderSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
@@ -714,7 +730,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.14.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.15.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
