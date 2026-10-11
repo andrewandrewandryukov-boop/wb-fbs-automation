@@ -133,7 +133,7 @@ export async function fourPagePngPdf(pages) {
     const scale=Math.min(w/img.width,h/img.height);
     const iw=img.width*scale,ih=img.height*scale;
     const x=(w-iw)/2,y=(h-ih)/2;
-    const content=ascii('q\\n'+[iw,0,0,ih,x,y].map(n=>n.toFixed(4)).join(' ')+' cm\\n/Im1 Do\\nQ\\n');
+    const content=ascii('q\n'+[iw,0,0,ih,x,y].map(n=>n.toFixed(4)).join(' ')+' cm\n/Im1 Do\nQ\n');
     objects.push(ascii('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 '+w.toFixed(4)+' '+h.toFixed(4)+'] /Resources << /XObject << /Im1 '+(base+2)+' 0 R >> >> /Contents '+(base+1)+' 0 R >>'));
     objects.push(streamObject('<<',content));
     objects.push(streamObject('<< /Type /XObject /Subtype /Image /Width '+img.width+' /Height '+img.height+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode'+(img.predictor?' /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns '+img.width+' >>':''),img.compressed));
