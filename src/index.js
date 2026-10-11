@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { officialPngPdf } from './pdf.js';
+import { officialPngPdf, fourPagePngPdf } from './pdf.js';
 
 // Private durable state: aggregate diagnostics plus order IDs for idempotency. No tokens or buyer details.
 export class DiagnosticHistory extends DurableObject {
@@ -11,7 +11,7 @@ export class DiagnosticHistory extends DurableObject {
     await this.ctx.storage.put('publicStatus',{
       ...previousStatus,
       service:'wb-fbs-automation',
-      version:'0.18.0',
+      version:'0.19.0',
       mode:'READ_ONLY',
       lastCheck:snapshot.at,
       healthy:!!snapshot.healthy,
@@ -59,7 +59,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.18.0',
+      ...current,service:'wb-fbs-automation',version:'0.19.0',
       mode:'READ_ONLY',orderMonitoring:'active',lastOrderPoll:at
     });
     return {newlySeen,seenInPoll:valid.length};
@@ -71,7 +71,7 @@ export class DiagnosticHistory extends DurableObject {
     });
     const current=(await this.ctx.storage.get('publicStatus'))||{};
     await this.ctx.storage.put('publicStatus',{
-      ...current,service:'wb-fbs-automation',version:'0.18.0',
+      ...current,service:'wb-fbs-automation',version:'0.19.0',
       mode:'READ_ONLY',orderMonitoring:'error',lastOrderPoll:at
     });
   }
@@ -91,7 +91,7 @@ export class DiagnosticHistory extends DurableObject {
   }
   async orderMonitorSummary() {
     const stats=(await this.ctx.storage.get('orderMonitor'))||{};
-    return {version:'0.18.0',mode:'READ_ONLY',...stats};
+    return {version:'0.19.0',mode:'READ_ONLY',...stats};
   }
   // Bootstrap one persistent five-minute alarm without a Cron Trigger.
   async ensureAlarm() {
@@ -142,6 +142,8 @@ export class DiagnosticHistory extends DurableObject {
       catch { console.error(JSON.stringify({event:'pending_order_probe_failed'})); }
       try { await this.probeHistoricalStickerPdfOnce(); }
       catch { console.error(JSON.stringify({event:'historical_sticker_pdf_probe_failed'})); }
+      try { await this.probeFourPageCompositorOnce(); }
+      catch { console.error(JSON.stringify({event:'four_page_compositor_probe_failed'})); }
       const hour=at.slice(0,13);
       if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
         const snapshot=await runScheduledDiagnostics(this.env);
@@ -621,6 +623,37 @@ export class DiagnosticHistory extends DurableObject {
     } catch { result.state='network_or_pdf_error'; }
     await this.ctx.storage.put('historicalStickerPdfProbeV1',result);
   }
+  // V0.19: a one-shot, entirely synthetic four-page compositor test.
+  // This does NOT test real cover/product text or prove labels are ready to print.
+  // No WB calls, no Telegram sends, no storage of images or PDF.
+  async probeFourPageCompositorOnce() {
+    if (await this.ctx.storage.get('fourPageCompositorProbeV1')) return;
+    const result={state:'started',at:new Date().toISOString(),mode:'READ_ONLY',
+      fixture:'synthetic_rgb_png_only',realOrderUsed:false};
+    await this.ctx.storage.put('fourPageCompositorProbeV1',result);
+    try {
+      const pages=[
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8//8/AwMDEwMDAwMDAwAkBgMB/DXemwAAAABJRU5ErkJggg==',
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP88OEDAwMDEwMDAwMDAwAh6gLUcoFD3wAAAABJRU5ErkJggg==',
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGO8c+cOAwMDEwMDAwMDAwAfGgKYD0CQvAAAAABJRU5ErkJggg==',
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII='
+      ];
+      const pdf=await fourPagePngPdf(pages);
+      const raw=new TextDecoder('latin1').decode(pdf);
+      const pageObjects=(raw.match(/\/Type \/Page \/Parent/g)||[]).length;
+      const mediaBoxes=(raw.match(/\/MediaBox \[0 0 113\.3858 85\.0394\]/g)||[]).length;
+      result.pageCount=pageObjects;
+      result.pageSize=mediaBoxes===4?'40x30mm':'unexpected';
+      result.pdfBytes=pdf.length;
+      result.pdfHeaderValid=raw.startsWith('%PDF-');
+      result.state=pageObjects===4 && mediaBoxes===4 && result.pdfHeaderValid
+        ? 'compositor_verified_synthetic_only':'compositor_validation_failed';
+    } catch { result.state='compositor_exception'; }
+    await this.ctx.storage.put('fourPageCompositorProbeV1',result);
+  }
+  async fourPageCompositorProbeSummary() {
+    return (await this.ctx.storage.get('fourPageCompositorProbeV1'))||{state:'not_started'};
+  }
   async historicalStickerPdfProbeSummary() {
     return (await this.ctx.storage.get('historicalStickerPdfProbeV1'))||{state:'not_started'};
   }
@@ -649,7 +682,7 @@ function historyStore(env) {
   return env.DIAG_HISTORY.get(env.DIAG_HISTORY.idFromName('wb-fbs-diagnostics-v1'));
 }
 
-// WB FBS Automation v0.18.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
+// WB FBS Automation v0.19.0 — one-shot safe live-order identity, content, official sticker and PDF preflight.
 const API = 'https://marketplace-api.wildberries.ru';
 const TARGET = 'Кавказский бульвар';
 const CHECKS = [
@@ -835,7 +868,7 @@ async function runScheduledDiagnostics(env) {
   const now=new Date();
   const snapshot={
     at:now.toISOString(),
-    version:'0.18.0',
+    version:'0.19.0',
     mode:'READ_ONLY',
     checks:{},
     healthy:false
@@ -898,7 +931,7 @@ export default {
   async fetch(request,env) {
     const path=new URL(request.url).pathname;
     if (request.method==='GET' && (path==='/' || path==='/health')) {
-      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.18.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
+      return Response.json({ok:true,service:'wb-fbs-automation',version:'0.19.0',mode:'READ_ONLY',orderPolling:'every_5_minutes',diagnostics:'hourly',scheduler:'durable_object_alarm'});
     }
     if (request.method==='GET' && path==='/status') {
       if (!env.DIAG_HISTORY) return Response.json({ok:false,error:'history_binding_not_configured'},{status:503});
@@ -907,7 +940,7 @@ export default {
       const latest=await store.publicStatus();
       return Response.json({
         ...(latest || {service:'wb-fbs-automation',mode:'READ_ONLY',status:'waiting_for_first_alarm'}),
-        version:'0.18.0',
+        version:'0.19.0',
         scheduler:'durable_object_alarm',
         telegram:!env.TELEGRAM_BOT_TOKEN?'not_configured':(!env.TELEGRAM_PAIR_CODE || env.TELEGRAM_PAIR_CODE.length<10)?'pair_code_not_configured':await store.telegramPairingState(),
         telegramTest:await store.telegramConnectionTestState(),
@@ -918,6 +951,7 @@ export default {
         orders:await store.publicOrderSummary(),
         pendingOrderProbe:await store.pendingOrderProbeSummary(),
         historicalStickerPdfProbe:await store.historicalStickerPdfProbeSummary(),
+        fourPageCompositorProbe:await store.fourPageCompositorProbeSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
@@ -931,7 +965,7 @@ export default {
     }
     if (path==='/diagnostics/history') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
-      return Response.json({version:'0.18.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
+      return Response.json({version:'0.19.0',mode:'READ_ONLY',history:await historyStore(env).recentHistory()},{headers:{'Cache-Control':'no-store'}});
     }
     return Response.json(path==='/diagnostics/shipping-dates' ? await auditShippingDates(env) : await runDiagnostics(env),{headers:{'Cache-Control':'no-store'}});
   },
