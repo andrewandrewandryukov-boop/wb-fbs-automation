@@ -1,9 +1,14 @@
 // One-shot, bounded, read-only audit of historic FBS assembly orders and supplies.
 // Never writes to WB; private DO state contains only supply/order IDs and product identifiers.
 const API='https://marketplace-api.wildberries.ru';
-const KEY='ff_reconcile_20261026_v1';
+const KEY='ff_reconcile_20261026_v2';
 const START='2026-08-08', END='2026-10-27', SKU='brcutt1green';
 const MAX_PAGES=12, MAX_SUPPLIES=1200, BATCH=8;
+// WB returns only the last 30 days unless dateFrom/dateTo are explicitly set.
+// Each interval is <=30 calendar days, with UTC timestamps including the full end date.
+const ORDER_WINDOWS=[['2026-08-08','2026-09-06'],['2026-09-07','2026-10-06'],['2026-10-07','2026-10-26']];
+const tsStart=d=>Math.floor(Date.parse(d+'T00:00:00Z')/1000);
+const tsEnd=d=>Math.floor(Date.parse(d+'T23:59:59Z')/1000);
 const now=()=>new Date().toISOString();
 const day=v=>String(v||'').slice(0,10);
 const uniq=xs=>[...new Set(xs)];
@@ -14,7 +19,7 @@ async function get(token,path) {
   if(!r.ok){const code=r.status;await r.body?.cancel();const e=new Error('wb_http_'+code);e.status=code;throw e;}
   return r.json();
 }
-function fresh(){return {phase:'orders',startedAt:now(),updatedAt:now(),orderNext:0,orderPages:0,orders:[],supplyNext:0,supplyPages:0,supplies:[],supplyIndex:0,assignments:[],unknownSupplyOrderIds:0,totalSupplyOrderIds:0,duplicateSupplyOrderIds:0,failures:0,stopReason:null,earliestOrderDay:null,earliestSupplyDay:null};}
+function fresh(){return {phase:'orders',startedAt:now(),updatedAt:now(),orderNext:0,orderPages:0,orderWindow:0,windowPages:0,orders:[],supplyNext:0,supplyPages:0,supplies:[],supplyIndex:0,assignments:[],unknownSupplyOrderIds:0,totalSupplyOrderIds:0,duplicateSupplyOrderIds:0,failures:0,stopReason:null,earliestOrderDay:null,earliestSupplyDay:null};}
 function nextCursor(data,current) {
   const n=data?.next;
   if(n===null||n===undefined||n===''||n===0||n==='0')return null;
@@ -29,6 +34,8 @@ function summarized(st){
   return {
     state:st.phase,readOnly:true,updatedAt:st.updatedAt,startedAt:st.startedAt,
     pages:{orders:st.orderPages,supplies:st.supplyPages},
+    orderDateWindows:{completed:st.orderWindow,planned:ORDER_WINDOWS.length,active:ORDER_WINDOWS[st.orderWindow]||null},
+    assemblyOrdersByMonth:Object.fromEntries(uniq((st.orders||[]).map(x=>x.createdAt.slice(0,7))).sort().map(m=>[m,(st.orders||[]).filter(x=>x.createdAt.startsWith(m)).length])),
     foundTargetAssemblyOrders:st.orders?.length||0,
     suppliesFound:st.supplies?.length||0,
     suppliesChecked:st.supplyIndex||0,
@@ -58,7 +65,9 @@ export async function runFfReconcileStep(storage,token) {
   if(st.retryAfter&&Date.parse(st.retryAfter)>Date.now())return;
   try {
     if(st.phase==='orders') {
-      const data=await get(token,'/api/v3/orders?limit=100&next='+encodeURIComponent(st.orderNext));
+      const window=ORDER_WINDOWS[st.orderWindow];
+      if(!window)throw new Error('invalid_orders_window');
+      const data=await get(token,'/api/v3/orders?limit=100&next='+encodeURIComponent(st.orderNext)+'&dateFrom='+tsStart(window[0])+'&dateTo='+tsEnd(window[1]));
       if(!Array.isArray(data?.orders))throw new Error('orders_shape');
       const seen=new Set(st.orders.map(x=>x.id));
       for(const o of data.orders) {
@@ -69,9 +78,14 @@ export async function runFfReconcileStep(storage,token) {
       for(const o of data.orders){const d=day(o.createdAt);if(d&&(!st.earliestOrderDay||d<st.earliestOrderDay))st.earliestOrderDay=d;}
       st.orderPages++;
       const next=nextCursor(data,st.orderNext);
-      if(next===null||data.orders.length===0){st.phase='supplies';}
-      else if(st.orderPages>=MAX_PAGES){st.phase='blocked';st.stopReason='orders_page_cap_reached';}
-      else st.orderNext=next;
+      if(next===null||data.orders.length===0){
+        st.orderWindow++;
+        st.orderNext=0;
+        st.windowPages=0;
+        if(st.orderWindow===ORDER_WINDOWS.length)st.phase='supplies';
+      }
+      else if(st.windowPages+1>=MAX_PAGES){st.phase='blocked';st.stopReason='orders_window_page_cap_reached';}
+      else {st.orderNext=next;st.windowPages++;}
     } else if(st.phase==='supplies') {
       const data=await get(token,'/api/v3/supplies?limit=100&next='+encodeURIComponent(st.supplyNext));
       if(!Array.isArray(data?.supplies))throw new Error('supplies_shape');
