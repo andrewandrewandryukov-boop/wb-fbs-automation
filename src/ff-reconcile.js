@@ -18,7 +18,7 @@ function fresh(){return {phase:'orders',startedAt:now(),updatedAt:now(),orderNex
 function nextCursor(data,current) {
   const n=data?.next;
   if(n===null||n===undefined||n===''||n===0||n==='0')return null;
-  if(!/^\\d+$/.test(String(n))||String(n)===String(current))throw new Error('invalid_next_cursor');
+  if(!/^[0-9]+$/.test(String(n))||String(n)===String(current))throw new Error('invalid_next_cursor');
   return n;
 }
 function summarized(st){
