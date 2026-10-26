@@ -1,8 +1,9 @@
 // One-shot, bounded, read-only audit of historic FBS assembly orders and supplies.
 // Never writes to WB; private DO state contains only supply/order IDs and product identifiers.
 const API='https://marketplace-api.wildberries.ru';
-const KEY='ff_reconcile_20261026_v3';
-const PREVIOUS_KEY='ff_reconcile_20261026_v2';
+const KEY='ff_reconcile_20261026_v4';
+const PREVIOUS_KEY='ff_reconcile_20261026_v3';
+const FALLBACK_KEY='ff_reconcile_20261026_v2';
 const START='2026-08-08', END='2026-10-27', SKU='brcutt1green';
 const MAX_PAGES=12, MAX_SUPPLIES=1200, BATCH=8, ORDER_LIMIT=1000;
 // WB returns only the last 30 days unless dateFrom/dateTo are explicitly set.
@@ -72,7 +73,7 @@ export async function runFfReconcileStep(storage,token) {
   if(!token)return;
   let st=await storage.get(KEY);
   if(!st) {
-    const previous=await storage.get(PREVIOUS_KEY);
+    const previous=(await storage.get(PREVIOUS_KEY))||(await storage.get(FALLBACK_KEY));
     st=fresh();
     // Keep all discovered order IDs while replaying the August window with lossless cursors.
     if(previous?.orders?.length) {
