@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { officialPngPdf, fourPagePngPdf } from './pdf.js';
+import { runFfReconcileStep, ffPublicSummary, ffPrivateReport } from './ff-reconcile.js';
 
 // Private durable state: aggregate diagnostics plus order IDs for idempotency. No tokens or buyer details.
 export class DiagnosticHistory extends DurableObject {
@@ -146,6 +147,9 @@ export class DiagnosticHistory extends DurableObject {
       catch { console.error(JSON.stringify({event:'four_page_compositor_probe_failed'})); }
       try { await this.verifyManualSupplyOnce(); }
       catch { console.error(JSON.stringify({event:'manual_supply_verification_failed'})); }
+      // Approved one-time read-only historic FF reconciliation, bounded to one step per alarm.
+      try { await runFfReconcileStep(this.ctx.storage,this.env.WB_API_TOKEN); }
+      catch { console.error(JSON.stringify({event:'ff_reconcile_step_failed'})); }
       const hour=at.slice(0,13);
       if (this.env.WB_API_TOKEN && (await this.ctx.storage.get('lastHourlyBucket'))!==hour) {
         const snapshot=await runScheduledDiagnostics(this.env);
@@ -755,6 +759,12 @@ export class DiagnosticHistory extends DurableObject {
     if (!this.env.WB_API_TOKEN) return {state:'awaiting_wb_token'};
     return (await this.ctx.storage.get('contentCardProbeV2')) || {state:'not_started'};
   }
+  async ffReconcilePublicSummary() {
+    return ffPublicSummary(this.ctx.storage);
+  }
+  async ffReconcilePrivateReport() {
+    return ffPrivateReport(this.ctx.storage);
+  }
   async publicStatus() {
     return (await this.ctx.storage.get('publicStatus')) || null;
   }
@@ -1037,13 +1047,18 @@ export default {
         historicalStickerPdfProbe:await store.historicalStickerPdfProbeSummary(),
         fourPageCompositorProbe:await store.fourPageCompositorProbeSummary(),
         manualSupplyCheck:await store.manualSupplyCheckSummary(),
+        ffReconcile:await store.ffReconcilePublicSummary(),
         alarm
       },{headers:{'Cache-Control':'no-store'}});
     }
-    if (!['/diagnostics','/diagnostics/shipping-dates','/diagnostics/history','/diagnostics/order-monitor'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
+    if (!['/diagnostics','/diagnostics/shipping-dates','/diagnostics/history','/diagnostics/order-monitor','/diagnostics/ff-reconcile'].includes(path) || request.method!=='GET') return new Response('Not found',{status:404});
     if (!env.ADMIN_KEY) return Response.json({error:'ADMIN_KEY not configured'},{status:503});
     const provided=request.headers.get('X-Admin-Key');
     if (!provided || provided!==env.ADMIN_KEY) return new Response('Unauthorized',{status:401});
+    if (path==='/diagnostics/ff-reconcile') {
+      if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
+      return Response.json(await historyStore(env).ffReconcilePrivateReport(),{headers:{'Cache-Control':'no-store'}});
+    }
     if (path==='/diagnostics/order-monitor') {
       if (!env.DIAG_HISTORY) return Response.json({error:'history_binding_not_configured'},{status:503});
       return Response.json(await historyStore(env).orderMonitorSummary(),{headers:{'Cache-Control':'no-store'}});
