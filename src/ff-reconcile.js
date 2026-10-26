@@ -21,7 +21,7 @@ async function get(token,path) {
   // WB's next is int64; JSON.parse rounds large integers beyond MAX_SAFE_INTEGER.
   // Extract its exact decimal representation from the response text before parsing.
   const raw=await r.text();
-  const match=raw.match(/"next"\\s*:\\s*"?(-?[0-9]+)"?(?=\\s*[,}])/);
+  const match=raw.match(/"next"\s*:\s*"?(-?[0-9]+)"?(?=\s*[,}])/);
   const data=JSON.parse(raw);
   return {data,rawNext:match?.[1]??null};
 }
